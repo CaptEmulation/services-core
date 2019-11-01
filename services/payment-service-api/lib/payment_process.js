@@ -6,9 +6,12 @@
 'use strict';
 const pagarme = require('pagarme');
 const R = require('ramda');
+const antifraudClient = require('./konduto_client')
 const { DateTime } = require('luxon');
 const { genAFMetadata } = require('./antifraud_context_gen');
 const { generateDalContext } = require('./dal');
+const { buildTransactionData } = require('./transaction_data_builder');
+const { buildAntifraudData } = require('./konduto_data_builder')
 
 /*
  * gatewayClient
@@ -30,90 +33,6 @@ const gatewayClient = async () => {
 const isForeign = (ctx) => {
     return  (ctx.payment.data.is_international || false);
 };
-
-/*
- * buildTransactionData(context)
- * build a object with transaction attributes
- * @param { Object } context - generated context from dal execution
- * @return { Object } - object with transaction attributes
- */
-const buildTransactionData = (context) => {
-    const payment = context.payment
-    const isCreditCard = payment.data.payment_method === 'credit_card'
-
-    return {
-        postback_url: process.env.POSTBACK_URL,
-        async :false,
-
-        payment_method: payment.data.payment_method,
-        amount: payment.data.amount,
-
-        ...(isCreditCard ? cardTransactionData(context) : bankSlipTransactionData(context)),
-        ...buildTransactionMetadata(payment)
-    }
-}
-
-/*
- * cardTransactionData(context)
- * build a object with credit card transaction attributes
- * @param { Object } context - generated context from dal execution
- * @return { Object } - object with credit card transaction attributes
- */
-const cardTransactionData = (context) => {
-    const payment = context.payment
-    const transactionDescription = (context.project.permalink || '').substring(0, 13)
-    const cardHash = payment.data.card_hash
-
-    return {
-        capture: false,
-        soft_descriptor: transactionDescription,
-        ...(cardHash ? { card_hash: card_hash } : { card_id: context.payment_card.gateway_data.id })
-    }
-}
-
-/*
- * bankSlipTransactionData(context)
- * build a object with bank slip transaction attributes
- * @param { Object } context - generated context from dal execution
- * @return { Object } - object with bank slip transaction attributes
- */
-const bankSlipTransactionData = (context) => {
-    const payment = context.payment
-    const customer = payment.data.customer
-    const isIndividual = customer.document_number.length === 11
-
-    return {
-        customer: {
-            name: customer.name,
-            type: isIndividual ? 'individual' : 'corporation',
-            documents: [
-                {
-                    type: isIndividual ? 'cpf' : 'cnpj',
-                    number: customer.document_number
-                }
-            ]
-        }
-    }
-            }
-
-/*
- * buildTransactionMetadata(context)
- * build a object with metadata transaction attributes
- * @param { Object } context - generated context from dal execution
- * @return { Object } - object with metadata transaction attributes
- */
-const buildTransactionMetadata = (payment) => {
-    return {
-        metadata: {
-            payment_id: payment.id,
-            project_id: payment.project_id,
-            platform_id: payment.platform_id,
-            subscription_id: payment.subscription_id,
-            user_id: payment.user_id,
-            cataloged_at: payment.created_at
-        }
-    }
-    }
 
 /*
  * expirationDate(accTime, plusDays)
@@ -160,6 +79,79 @@ const fetchTransactionPayables = async (transactionId) => {
 };
 
 /*
+ * authorizeAnalyzeAndCapturePayment(paymentContext, dalContext)
+ * Authorize, Analyze and capture payment
+ * @param { Object } paymentContext
+ * @param { Object } dalContext
+ * @return { Object } transaction
+ */
+const authorizeAnalyzeAndCapturePayment = async (paymentContext, dalContext) => {
+    const client = await gatewayClient();
+    let transaction = await createTransaction(paymentContext)
+
+    if (transaction.payment_method === 'boleto') {
+        return transaction
+    }
+
+    if (await shouldSendTransactionToAntifraud(transaction, dalContext)) {
+        const shouldAnalyze = transaction.status === 'authorized'
+        const antifraudResponse = await sendToTransactionAntifraud(paymentContext, { shouldAnalyze, transaction })
+
+        if (shouldAnalyze) {
+            if (antifraudResponse.data.order.recommendation === 'APPROVE') {
+                transaction = await client.withVersion('2019-09-01').transactions.capture({ id: transaction.id })
+            } else if (antifraudResponse.data.order.recommendation === 'DECLINE') {
+                transaction = await client.withVersion('2019-09-01').transactions.refund({ id: transaction.id })
+            }
+        }
+    } else if (transaction.status === 'authorized') {
+        transaction = await client.withVersion('2019-09-01').transactions.capture({ id: transaction.id })
+    }
+
+    return transaction
+}
+
+/*
+ * createTransaction(paymentContext)
+ * Create transaction on gateway
+ * @param { Object } paymentContext
+ * @return { Object } transaction
+ */
+const createTransaction = async (paymentContext) => {
+    let transactionData = buildTransactionData(paymentContext)
+
+    return await createGatewayTransaction(transactionData)
+}
+
+/*
+ * shouldSendTransactionToAntifraud(transaction, dalContext)
+ * Check if transaction is authorized and has a new credit card or transaction is refused
+ * @param { Object } transaction
+ * @param { Object } dalContext
+ * @return { Boolean } should send to antifraud
+ */
+const shouldSendTransactionToAntifraud = async (transaction, dalContext) => {
+    const isAuthorized = transaction.payment_method === 'credit_card' && transaction.status === 'authorized'
+    const isRefused = transaction.status === 'refused'
+    const isCardAlreadyAnalyzedOnAntifraud = await dalContext.isCardAlreadyAnalyzedOnAntifraud(transaction.card.id)
+
+    return (isAuthorized && !isCardAlreadyAnalyzedOnAntifraud) || isRefused
+}
+
+/*
+ * sendToTransactionAntifraud(paymentContext, dalContext)
+ * Send transaction to antifraud
+ * @param { Object } paymentContext
+ * @param { Object } options
+ * @return { Object } antifraud response
+ */
+const sendToTransactionAntifraud = async (paymentContext, options) => {
+    const antifraudData = buildAntifraudData(paymentContext, options)
+
+    return antifraudClient.createOrder(antifraudData)
+}
+
+/*
  * processGeneratedCard(paymentId)
  * start processing a new payment on gateway
  * @param { Object } dbclient - postgres connection client
@@ -168,17 +160,17 @@ const fetchTransactionPayables = async (transactionId) => {
  * @return { Object } transaction, payables, payment, subscription - the gateway generated transaction
  */
 const processPayment = async (dbclient, paymentId) => {
-    const dalCtx = generateDalContext(dbclient),
-        ctx = await dalCtx.loadPaymentContext(paymentId),
-        hasSubcription = !R.isNil(ctx.subscription),
-        subscriptionHasCard = hasSubcription && !R.isNil(ctx.subscription.credit_card_id),
-        shouldSaveCard = (ctx.payment.data.save_card && !hasSubcription) || (hasSubcription && subscriptionHasCard),
-        anyTransactionInInitialStatus = (s => s === 'waiting_payment' || s === 'processing'),
-        anyTransactionInpaidOrRefused = (s => s === 'paid' || s === 'refused');
+    const dalCtx = generateDalContext(dbclient)
+    const ctx = await dalCtx.loadPaymentContext(paymentId)
+    const hasSubcription = !R.isNil(ctx.subscription)
+    const subscriptionHasCard = hasSubcription && !R.isNil(ctx.subscription.credit_card_id)
+    const shouldSaveCard = (ctx.payment.data.save_card && !hasSubcription) || (hasSubcription && subscriptionHasCard)
+    const anyTransactionInInitialStatus = (s => ['waiting_payment', 'processing', 'authorized'].includes(s))
 
     try {
         await dbclient.query('BEGIN;');
-        const transaction = await createGatewayTransaction(buildTransactionData(ctx))
+        const transaction = await authorizeAnalyzeAndCapturePayment(ctx, dalCtx)
+
         const payables = await fetchTransactionPayables(transaction.id)
         const transaction_reason = { transaction, payables }
         const isPendingPayment = anyTransactionInInitialStatus(transaction.status);
@@ -212,7 +204,6 @@ const processPayment = async (dbclient, paymentId) => {
         if ( !isPendingPayment ) {
             await dalCtx.paymentTransitionTo(paymentId, transaction.status, transaction_reason);
 
-
             // transition subscription when have one and status is paid or refused
             if ( hasSubcription && transaction.status == 'paid') {
                 await dalCtx.subscriptionTransitionTo(ctx.payment.subscription_id, 'active', transaction_reason);
@@ -230,6 +221,7 @@ const processPayment = async (dbclient, paymentId) => {
         };
     } catch(err) {
         await dbclient.query('ROLLBACK');
+
         if(err.response && err.response.errors) {
             console.log('error on processing', err.response.errors);
             try {
