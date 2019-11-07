@@ -4,7 +4,6 @@ const test = require('ava');
 const { DateTime } = require('luxon');
 const R = require('ramda');
 const nock = require('nock');
-const sinon = require('sinon');
 const helpers = require('../support/helpers');
 let {
     buildTransactionData,
