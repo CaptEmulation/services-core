@@ -31,7 +31,7 @@ const cardTransactionData = (context) => {
   const payment = context.payment
   const transactionDescription = (context.project.permalink || '').substring(0, 13)
   const cardHash = { card_hash: payment.data.card_hash }
-  const cardId = { card_id: context.payment_card.gateway_data.id }
+  const cardId = { card_id: context.payment_card && context.payment_card.gateway_data.id }
   const cardIdentifier = payment.data.card_hash ? cardHash : cardId
 
   return {
